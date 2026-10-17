@@ -60,7 +60,7 @@ type pbes2Params struct {
 	KeyDerivation algorithmIdentifier // PBKDF2 + params
 	Encryption    algorithmIdentifier // aes256-CBC + IV OCTET STRING
 }
-type loginASN1 struct { // logins.json entry: { keyID, {des-ede3-cbc, iv}, cipher }
+type loginASN1 struct { // logins.json entry: { keyID, {OID, iv}, cipher } — see decryptLogin
 	KeyID  []byte
 	Algo   algorithmIdentifier
 	Cipher []byte
@@ -69,6 +69,9 @@ type loginASN1 struct { // logins.json entry: { keyID, {des-ede3-cbc, iv}, ciphe
 var (
 	oidPBES2      = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 13}
 	oid3DESLegacy = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 12, 5, 1, 3}
+	// Cipher OIDs a logins.json entry carries in its AlgorithmIdentifier:
+	oidAES256CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42} // 2.16.840.1.101.3.4.1.42
+	oidDES3CBC   = asn1.ObjectIdentifier{1, 2, 840, 113549, 3, 7}         // 1.2.840.113549.3.7
 )
 
 func pkcs7Unpad(b []byte, blockSize int) ([]byte, error) {
@@ -170,8 +173,10 @@ func legacy3DESKeyIV(globalSalt, entrySalt []byte) (key, iv []byte) {
 	return k[:24], k[len(k)-8:]
 }
 
-// recoverMasterKey reads key4.db, verifies password-check, and returns the 24-byte
-// 3DES master key from nssPrivate.a11.
+// recoverMasterKey reads key4.db, verifies password-check, and returns the raw
+// NSS logins master key from nssPrivate.a11: a 24-byte 3DES key (legacy
+// profiles) or a 32-byte AES-256 key (modern NSS). decryptLogin picks the
+// per-entry cipher from the entry's own algorithm identifier.
 func recoverMasterKey(key4Path string) ([]byte, error) {
 	// Through dbSource, not a bare immutable=1 connection. key4.db is a
 	// rollback-journal database, and immutable=1 tells SQLite to skip recovery
@@ -207,17 +212,20 @@ func recoverMasterKey(key4Path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The master key blob is an ASN.1 { OID, OCTET STRING key } after unpad; but
-	// in practice NSS stores the 24-byte 3DES key as the last 24 bytes. Unpad then
-	// take the trailing 24 bytes.
+	// After unpadding, NSS stores the master key as a bare key — 24 bytes for
+	// legacy 3DES profiles, 32 bytes for modern AES-256 profiles — with no
+	// DER wrapper. Returning a 24-byte slice of a 32-byte key (as v0.2.0 did)
+	// turned it into a random 3DES key and silently dropped every login.
 	dec, err = pkcs7Unpad(dec, blockSizeFor(a11))
 	if err != nil {
 		return nil, err
 	}
-	if len(dec) < 24 {
-		return nil, fmt.Errorf("master key too short: %d", len(dec))
+	switch len(dec) {
+	case 24, 32:
+		return dec, nil
+	default:
+		return nil, fmt.Errorf("unsupported master key length %d", len(dec))
 	}
-	return dec[len(dec)-24:], nil
 }
 
 func blockSizeFor(raw []byte) int {
@@ -264,6 +272,12 @@ func LoadCredentials(profileDir string) (*Credentials, error) {
 	return creds, nil
 }
 
+// decryptLogin decrypts one logins.json field. The entry's AlgorithmIdentifier
+// selects the cipher: modern NSS writes AES-256-CBC entries (16-byte IV)
+// against a 32-byte master key, legacy profiles write des-EDE3-CBC entries
+// (8-byte IV) against a 24-byte key. Entries with an unknown OID fall back to
+// the master key length (32 => AES-256, 24 => 3DES); a key-length/OID mismatch
+// is a per-entry error, which LoadCredentials skips via `continue`.
 func decryptLogin(masterKey []byte, b64 string) (string, error) {
 	raw, err := base64.StdEncoding.DecodeString(b64)
 	if err != nil {
@@ -276,6 +290,36 @@ func decryptLogin(masterKey []byte, b64 string) (string, error) {
 	var iv []byte
 	if _, err := asn1.Unmarshal(l.Algo.Parameters.FullBytes, &iv); err != nil {
 		return "", err
+	}
+	useAES := l.Algo.Algorithm.Equal(oidAES256CBC)
+	useDES := l.Algo.Algorithm.Equal(oidDES3CBC)
+	if !useAES && !useDES {
+		switch len(masterKey) {
+		case 32:
+			useAES = true
+		case 24:
+			useDES = true
+		default:
+			return "", fmt.Errorf("unsupported login entry algorithm %v (master key %d bytes)",
+				l.Algo.Algorithm, len(masterKey))
+		}
+	}
+	if useAES {
+		if len(masterKey) != 32 {
+			return "", fmt.Errorf("AES-256-CBC entry but master key is %d bytes", len(masterKey))
+		}
+		pt, err := aesCBCDecrypt(masterKey, iv, l.Cipher)
+		if err != nil {
+			return "", err
+		}
+		pt, err = pkcs7Unpad(pt, 16)
+		if err != nil {
+			return "", err
+		}
+		return string(pt), nil
+	}
+	if len(masterKey) != 24 {
+		return "", fmt.Errorf("des-EDE3-CBC entry but master key is %d bytes", len(masterKey))
 	}
 	pt, err := des3CBCDecrypt(masterKey, iv, l.Cipher)
 	if err != nil {
