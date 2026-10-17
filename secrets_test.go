@@ -89,12 +89,12 @@ func des3CBCEncrypt(key, iv, pt []byte) []byte {
 }
 
 // ---- OIDs used only when building the fixture ----
+// oidAES256CBC and oidDES3CBC (the logins.json entry ciphers) now live in
+// secrets.go, since production code dispatches on them.
 
 var (
 	oidPBKDF2     = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 5, 12}
 	oidHmacSHA256 = asn1.ObjectIdentifier{1, 2, 840, 113549, 2, 9}
-	oidAES256CBC  = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42}
-	oidDES3CBC    = asn1.ObjectIdentifier{1, 2, 840, 113549, 3, 7}
 )
 
 // Fixed (deterministic) fixture material.
@@ -113,6 +113,12 @@ var (
 		0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
 		0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
 		0x13, 0x37, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
+	}
+	fxAESMasterKey = []byte{ // 32-byte AES-256 master key (modern NSS)
+		0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+		0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+		0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+		0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
 	}
 	fxLoginIV = []byte{0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11}
 	fxCKAID   = []byte{
@@ -191,11 +197,41 @@ func buildLogin(masterKey []byte, plaintext string) string {
 	return base64.StdEncoding.EncodeToString(loginDER)
 }
 
-// writeNSSFixture generates a real, format-correct key4.db + logins.json in dir.
+// buildLoginAES256 builds one base64 logins.json entry in the modern NSS
+// shape: AES-256-CBC with a 16-byte per-entry IV.
+func buildLoginAES256(masterKey []byte, plaintext string) string {
+	iv := []byte{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	}
+	ivDER, err := asn1.Marshal(iv) // OCTET STRING
+	Expect(err).NotTo(HaveOccurred())
+	ct := aesCBCEncrypt(masterKey, iv, pkcs7Pad([]byte(plaintext), 16))
+	loginDER, err := asn1.Marshal(loginASN1{
+		KeyID: fxCKAID,
+		Algo: algorithmIdentifier{
+			Algorithm:  oidAES256CBC,
+			Parameters: asn1.RawValue{FullBytes: ivDER},
+		},
+		Cipher: ct,
+	})
+	Expect(err).NotTo(HaveOccurred())
+	return base64.StdEncoding.EncodeToString(loginDER)
+}
+
+// writeNSSFixture generates a real, format-correct key4.db + logins.json in dir
+// with the legacy 24-byte 3DES master key and des-EDE3-CBC login entries.
 // An empty masterPassword yields a decryptable profile; a non-empty one encrypts
 // the password-check with a key the empty-password path cannot reproduce, so
 // LoadCredentials reports ErrMasterPassword.
 func writeNSSFixture(dir, masterPassword string) {
+	writeNSSFixtureKey(dir, masterPassword, fxMasterKey, buildLogin)
+}
+
+// writeNSSFixtureKey is the shared fixture writer: masterKey is stored as the
+// a11 plaintext (24 bytes => legacy 3DES, 32 bytes => modern AES-256) and
+// loginBuild creates logins.json entries in the matching entry shape.
+func writeNSSFixtureKey(dir, masterPassword string, masterKey []byte, loginBuild func(key []byte, plain string) string) {
 	// password-check is encrypted with the (possibly master-password-derived) key.
 	checkKey := derivePBES2(fxGlobalSalt, fxEntrySalt, fxIters, masterPassword)
 	item2 := buildPBES2Item(checkKey, []byte("password-check"))
@@ -203,7 +239,7 @@ func writeNSSFixture(dir, masterPassword string) {
 	// The wrapped master key is always encrypted with the empty-password key,
 	// which is the only key recoverMasterKey derives once password-check passes.
 	emptyKey := derivePBES2(fxGlobalSalt, fxEntrySalt, fxIters, "")
-	a11 := buildPBES2Item(emptyKey, fxMasterKey)
+	a11 := buildPBES2Item(emptyKey, masterKey)
 
 	dbPath := filepath.Join(dir, "key4.db")
 	db, err := sql.Open("sqlite", "file:"+dbPath)
@@ -225,8 +261,8 @@ func writeNSSFixture(dir, masterPassword string) {
 		"logins": []map[string]any{
 			{
 				"hostname":          "imap://imap.example.com",
-				"encryptedUsername": buildLogin(fxMasterKey, "alice@example.com"),
-				"encryptedPassword": buildLogin(fxMasterKey, "s3cret-imap"),
+				"encryptedUsername": loginBuild(masterKey, "alice@example.com"),
+				"encryptedPassword": loginBuild(masterKey, "s3cret-imap"),
 			},
 		},
 	}
@@ -308,5 +344,38 @@ var _ = Describe("LoadCredentials against a key4.db with a hot rollback journal"
 		pw, ok := creds.Lookup("imap.example.com", "alice@example.com")
 		Expect(ok).To(BeTrue())
 		Expect(pw).To(Equal("s3cret-imap"))
+	})
+})
+
+var _ = Describe("LoadCredentials with a modern (AES-256) profile", func() {
+	It("recovers the 32-byte master key and decrypts AES-256-CBC logins", func() {
+		dir := GinkgoT().TempDir()
+		writeNSSFixtureKey(dir, "", fxAESMasterKey, buildLoginAES256)
+		creds, err := LoadCredentials(dir)
+		Expect(err).NotTo(HaveOccurred())
+		pw, ok := creds.Lookup("imap.example.com", "alice@example.com")
+		Expect(ok).To(BeTrue())
+		Expect(pw).To(Equal("s3cret-imap"))
+	})
+})
+
+var _ = Describe("decryptLogin entry cipher dispatch", func() {
+	It("decrypts a legacy des-EDE3-CBC entry with a 24-byte key", func() {
+		got, err := decryptLogin(fxMasterKey, buildLogin(fxMasterKey, "alice@example.com"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(Equal("alice@example.com"))
+	})
+	It("decrypts a modern AES-256-CBC entry with a 32-byte key", func() {
+		got, err := decryptLogin(fxAESMasterKey, buildLoginAES256(fxAESMasterKey, "bob@example.com"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(got).To(Equal("bob@example.com"))
+	})
+	It("rejects an AES-256 entry when only a 24-byte key was recovered", func() {
+		_, err := decryptLogin(fxMasterKey, buildLoginAES256(fxAESMasterKey, "bob@example.com"))
+		Expect(err).To(HaveOccurred())
+	})
+	It("rejects a 3DES entry when a 32-byte key was recovered", func() {
+		_, err := decryptLogin(fxAESMasterKey, buildLogin(fxMasterKey, "alice@example.com"))
+		Expect(err).To(HaveOccurred())
 	})
 })
