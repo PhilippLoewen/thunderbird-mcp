@@ -99,6 +99,9 @@ func aesCBCDecrypt(key, iv, ct []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(iv) != blk.BlockSize() {
+		return nil, fmt.Errorf("aes: IV length %d != block size %d", len(iv), blk.BlockSize())
+	}
 	if len(ct)%blk.BlockSize() != 0 {
 		return nil, errors.New("aes: ciphertext not a multiple of block size")
 	}
@@ -111,6 +114,9 @@ func des3CBCDecrypt(key, iv, ct []byte) ([]byte, error) {
 	blk, err := des.NewTripleDESCipher(key)
 	if err != nil {
 		return nil, err
+	}
+	if len(iv) != blk.BlockSize() {
+		return nil, fmt.Errorf("3des: IV length %d != block size %d", len(iv), blk.BlockSize())
 	}
 	if len(ct)%blk.BlockSize() != 0 {
 		return nil, errors.New("3des: ciphertext not a multiple of block size")

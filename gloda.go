@@ -42,7 +42,7 @@ type SearchQuery struct {
 }
 
 const glodaSelect = `
-SELECT f.folderURI, m.messageKey, m.date, t.c1subject, t.c3author, t.c0body
+SELECT f.folderURI, m.messageKey, m.date, COALESCE(t.c1subject,''), COALESCE(t.c3author,''), COALESCE(t.c0body,'')
 FROM messagesText_content t
 JOIN messages m ON m.id = t.docid
 JOIN folderLocations f ON f.id = m.folderID
